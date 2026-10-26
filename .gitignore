@@ -1,0 +1,14 @@
+# Ignore sensitive credentials & local tokens
+google_creds.json
+*.json
+.env
+
+# Ignore Python runtime files
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.DS_Store
+# --- EXCLUDE SPECIFIC FOLDERS ---
+for_reauth/
