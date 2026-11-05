@@ -17,4 +17,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Default fallback command if executed without arguments
-CMD ["python", "sales/ingestion.py"]
+CMD ["python", "personnel_requisition/prf.py"]

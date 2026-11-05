@@ -1,10 +1,12 @@
 # Ignore sensitive credentials & local tokens
 google_creds.json
+service_account.json
 *.json
 .env
 
 # Ignore Python runtime files
 __pycache__/
+for_testing/ 
 *.py[cod]
 *$py.class
 .venv/

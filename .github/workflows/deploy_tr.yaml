@@ -1,0 +1,40 @@
+name: Deploy Flowserve Transfer Request Tickets Cloud Run Job
+
+on:
+  workflow_dispatch: # Allows manual trigger from the Actions tab
+  push:
+    branches:
+      - main
+    paths:
+      - 'transfer_request/tr.py'
+      - 'Dockerfile'
+      - 'requirements.txt'
+
+jobs:
+  deploy-job:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_CREDENTIALS }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy Flowserve Transfer Request Tickets Job to Cloud Run
+        run: |
+          gcloud run jobs deploy fs-tr-tickets-job \
+            --source . \
+            --command "python" \
+            --args "transfer_request/tr.py" \
+            --region asia-southeast1 \
+            --project p26586absik25-absinova \
+            --memory 2Gi \
+            --max-retries 0 \
+            --service-account="edw-data-integration@p26586absik25-absinova.iam.gserviceaccount.com" \
+            --set-secrets="GOOGLE_CLIENT_ID=GOOGLE_CLIENT_ID:latest,GOOGLE_CLIENT_SECRET=GOOGLE_CLIENT_SECRET:latest,GOOGLE_REFRESH_TOKEN=GOOGLE_REFRESH_TOKEN:latest"

@@ -1,0 +1,71 @@
+name: Google Chat Repo Activity Notifier
+
+on:
+  push:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - review_requested
+
+jobs:
+  notify-gchat:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+
+    steps:
+      - name: Send Notification to Google Chat
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          ACTOR: ${{ github.actor }}
+          BRANCH: ${{ github.ref_name }}
+          REPO_NAME: ${{ github.repository }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_API_URL: ${{ github.event.pull_request.url }}
+          PR_ACTION: ${{ github.event.action }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.event.after }}
+          WEBHOOK_URL: ${{ secrets.GOOGLE_CHAT_WEBHOOK_URL }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "$EVENT_NAME" = "push" ]; then
+            # Use single commit endpoint for initial push, otherwise compare endpoint
+            if [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ] || [ -z "$BEFORE_SHA" ]; then
+              API_URL="https://api.github.com/repos/${GITHUB_REPOSITORY}/commits/${AFTER_SHA}"
+            else
+              API_URL="https://api.github.com/repos/${GITHUB_REPOSITORY}/compare/${BEFORE_SHA}...${AFTER_SHA}"
+            fi
+
+            # Query GitHub REST API directly for changed files
+            FILES=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github+json" "$API_URL" | jq -r '.files[]?.filename // empty' | head -n 10 | sed 's/^/• /')
+
+            # Fallback to local event payload JSON if API call returns empty
+            if [ -z "$FILES" ]; then
+              FILES=$(jq -r '[.commits[]? | (.added[], .modified[], .removed[])?] | unique | .[:10] | map("• " + .) | join("\n")' "$GITHUB_EVENT_PATH" 2>/dev/null)
+            fi
+
+            if [ -z "$FILES" ] || [ "$FILES" = "null" ]; then
+              FILES="• No file changes detected"
+            fi
+
+            TEXT=$(printf "🚀 *New Push Activity!*\n\n*Repository:* %s (%s)\n*Pushed By:* %s\n*Commit Message:* %s\n\n📁 *Changed Files:*\n%s" "$REPO_NAME" "$BRANCH" "$ACTOR" "$COMMIT_MSG" "$FILES")
+
+          elif [ "$EVENT_NAME" = "pull_request" ]; then
+            # Query PR API endpoint for changed files
+            FILES=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github+json" "${PR_API_URL}/files" | jq -r '.[].filename? // empty' | head -n 10 | sed 's/^/• /')
+
+            if [ -z "$FILES" ]; then
+              FILES="• No file changes detected"
+            fi
+
+            TEXT=$(printf "🔀 *Pull Request Activity (%s)!*\n\n*Repository:* %s\n*Title:* %s\n*Author:* %s\n*Link:* %s\n\n📁 *Changed Files:*\n%s" "$PR_ACTION" "$REPO_NAME" "$PR_TITLE" "$ACTOR" "$PR_URL" "$FILES")
+          fi
+
+          jq -n --arg text "$TEXT" '{text: $text}' | \
+          curl -X POST -H "Content-Type: application/json" -d @- "$WEBHOOK_URL"
