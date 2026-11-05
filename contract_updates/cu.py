@@ -1,7 +1,7 @@
 """
 Extract form submissions for 'Contract Updates Form', filter by Target Company ID, 
 and output to a BRAND NEW Google Sheet inside the Shared Drive folder.
-Naming convention: Contract Updates Form_MMDDYYYY
+Sends Google Chat notifications on success or failure.
 """
 
 import os
@@ -9,6 +9,7 @@ import json
 from datetime import datetime
 import gspread
 import google.auth
+import requests
 from google.cloud import firestore
 from google.oauth2.service_account import Credentials as SACredentials
 from google.oauth2.credentials import Credentials as UserCredentials
@@ -22,6 +23,7 @@ FIRESTORE_PROJECT_ID = "ticketingtool-prod"
 TARGET_COMPANY_ID = "1EMo1zoZuqqDNINR678H"
 FIELD_DEF_SHEET_ID = "1xaYPnEbx9s4Ho7uXgNJTiAnhEHA3utF7BDIYJZaCXDg"
 SHARED_DRIVE_FOLDER_ID = "12CHNWIQuqMbIHZrFRI2mYp7fF7eJ2kxH"
+GOOGLE_CHAT_WEBHOOK_URL = "https://chat.googleapis.com/v1/spaces/AAQAs8p7PtA/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI&token=lqmAjuB24vE7g8RvwMixHStMkGrt6myBGA5xSrE9qFQ"
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -32,11 +34,21 @@ SCOPES = [
 # ==============================================================================
 
 
+def send_google_chat_notification(text):
+    try:
+        response = requests.post(
+            GOOGLE_CHAT_WEBHOOK_URL,
+            json={"text": text},
+            headers={"Content-Type": "application/json; charset=UTF-8"},
+            timeout=10
+        )
+        response.raise_for_status()
+        print("🔔 Google Chat notification sent successfully.")
+    except Exception as e:
+        print(f"⚠️ Failed to send Google Chat notification: {e}")
+
+
 def get_credentials():
-    """
-    1. Tries Application Default Credentials (ADC) — auto-authenticates natively in Cloud Run.
-    2. Falls back to local 'service_account.json' or 'google_creds.json' for local runs.
-    """
     try:
         creds, project = google.auth.default(scopes=SCOPES)
         print("🔒 Authenticated natively via Cloud Run Service Account (ADC)")
@@ -100,121 +112,143 @@ def format_cell_value(val, subsidiary_map=None):
 
 
 def main():
+    today_str = datetime.now().strftime("%m/%d/%Y")
     print(f"🚀 Starting extraction script for: {TARGET_FORM}")
-    print("🔑 Authenticating...")
-    creds = get_credentials()
-    gc = gspread.authorize(creds)
-    db = firestore.Client(credentials=creds, project=FIRESTORE_PROJECT_ID)
 
-    # 1. Fetch Definition Headers
-    print("📊 Opening definition spreadsheet...")
-    def_spreadsheet = gc.open_by_key(FIELD_DEF_SHEET_ID)
     try:
-        ws = def_spreadsheet.worksheet(TARGET_FORM)
-    except gspread.WorksheetNotFound:
-        print(f"❌ Error: Tab '{TARGET_FORM}' not found in definition sheet.")
-        return
+        print("🔑 Authenticating...")
+        creds = get_credentials()
+        gc = gspread.authorize(creds)
+        db = firestore.Client(credentials=creds, project=FIRESTORE_PROJECT_ID)
 
-    values = ws.get_all_values()
-    header = values[0] if values else []
-    label_idx = find_col(header, "Field Label")
-    name_idx = find_col(header, "Field Name")
-    id_idx = find_col(header, "Field ID")
+        # 1. Fetch Definition Headers
+        print("📊 Opening definition spreadsheet...")
+        def_spreadsheet = gc.open_by_key(FIELD_DEF_SHEET_ID)
+        try:
+            ws = def_spreadsheet.worksheet(TARGET_FORM)
+        except gspread.WorksheetNotFound:
+            raise ValueError(f"Tab '{TARGET_FORM}' not found in definition sheet.")
 
-    field_definitions = []
-    for row in values[1:]:
-        fid = row[id_idx].strip() if (id_idx is not None and id_idx < len(row)) else ""
-        fname = row[name_idx].strip() if (name_idx is not None and name_idx < len(row)) else ""
-        flabel = row[label_idx].strip() if (label_idx is not None and label_idx < len(row)) else ""
-        
-        display_header = flabel if flabel else (fname if fname else fid)
-        if fid or fname:
-            field_definitions.append((fid, fname, display_header))
+        values = ws.get_all_values()
+        header = values[0] if values else []
+        label_idx = find_col(header, "Field Label")
+        name_idx = find_col(header, "Field Name")
+        id_idx = find_col(header, "Field ID")
 
-    if not field_definitions:
-        print(f"⚠️ No fields defined for '{TARGET_FORM}'. Exiting.")
-        return
-
-    # 2. Fetch Reference Collections
-    print("🏢 Fetching reference collections...")
-    subsidiary_map = {sub.id: (sub.to_dict().get("name") or sub.to_dict().get("subsidiaryName") or sub.id) for sub in db.collection("subsidiaries").stream()}
-    
-    workflow_map = {}
-    target_workflow_ids = []
-    for wf in db.collection("approvalWorkflows").stream():
-        service_name = wf.to_dict().get("service", "").strip()
-        workflow_map[wf.id] = service_name
-        if service_name.lower() == TARGET_FORM.lower():
-            target_workflow_ids.append(wf.id)
-
-    print(f"📌 Found workflow IDs for '{TARGET_FORM}': {target_workflow_ids}")
-
-    # 3. Targeted Query for serviceRequests
-    print(f"🔍 Fetching and filtering 'serviceRequests' for '{TARGET_FORM}'...")
-    raw_docs = []
-    for wf_id in target_workflow_ids:
-        query = db.collection("serviceRequests").where("workflowId", "==", wf_id)
-        for doc in query.stream():
-            d = doc.to_dict()
-            d["__doc_id__"] = doc.id
+        field_definitions = []
+        for row in values[1:]:
+            fid = row[id_idx].strip() if (id_idx is not None and id_idx < len(row)) else ""
+            fname = row[name_idx].strip() if (name_idx is not None and name_idx < len(row)) else ""
+            flabel = row[label_idx].strip() if (label_idx is not None and label_idx < len(row)) else ""
             
-            company_val = get_value_from_doc(d, "company", "company")
-            if company_val and str(company_val).strip() == TARGET_COMPANY_ID:
-                d["__service__"] = workflow_map.get(wf_id, TARGET_FORM)
-                raw_docs.append(d)
+            display_header = flabel if flabel else (fname if fname else fid)
+            if fid or fname:
+                field_definitions.append((fid, fname, display_header))
 
-    print(f"🎯 Found {len(raw_docs)} matching service requests.")
+        if not field_definitions:
+            raise ValueError(f"No fields defined for '{TARGET_FORM}'.")
 
-    # 4. Targeted Query for tickets
-    ticket_map = {}
-    matching_req_ids = [d["__doc_id__"] for d in raw_docs]
-    if matching_req_ids:
-        print("🎟️ Fetching ticket metadata...")
-        chunk_size = 30
-        for i in range(0, len(matching_req_ids), chunk_size):
-            chunk = matching_req_ids[i:i + chunk_size]
-            for tk in db.collection("tickets").where("requestId", "in", chunk).stream():
-                t_data = tk.to_dict()
-                req_id = t_data.get("requestId")
-                if req_id:
-                    ticket_map[req_id] = {
-                        "ticket_id": t_data.get("id", ""),
-                        "created_at": t_data.get("createdAt", "")
-                    }
-
-    # 5. Extract Data Rows
-    headers = ["Ticket ID", "Ticket Created At", "Service", "Document ID"] + [h for _, _, h in field_definitions]
-    rows = []
-    for doc in raw_docs:
-        tk_info = ticket_map.get(doc["__doc_id__"], {})
-        ticket_id = tk_info.get("ticket_id", "No Ticket ID")
-        created_at = tk_info.get("created_at", "")
+        # 2. Fetch Reference Collections
+        print("🏢 Fetching reference collections...")
+        subsidiary_map = {sub.id: (sub.to_dict().get("name") or sub.to_dict().get("subsidiaryName") or sub.id) for sub in db.collection("subsidiaries").stream()}
         
-        row = [ticket_id, created_at, doc["__service__"], doc["__doc_id__"]]
-        has_any_value = False
-        for fid, fname, _ in field_definitions:
-            raw_val = get_value_from_doc(doc, fid, fname)
-            formatted_val = format_cell_value(raw_val, subsidiary_map)
-            if formatted_val != "":
-                has_any_value = True
-            row.append(formatted_val)
-        
-        if has_any_value:
-            rows.append(row)
+        workflow_map = {}
+        target_workflow_ids = []
+        for wf in db.collection("approvalWorkflows").stream():
+            service_name = wf.to_dict().get("service", "").strip()
+            workflow_map[wf.id] = service_name
+            if service_name.lower() == TARGET_FORM.lower():
+                target_workflow_ids.append(wf.id)
 
-    # 6. Create Brand New Google Sheet in Shared Drive Folder
-    today_str = datetime.now().strftime("%m%d%Y")
-    safe_form_name = TARGET_FORM.replace("/", "-")
-    sheet_title = f"{safe_form_name}_{today_str}"
-    
-    print(f"➕ Creating Google Sheet: '{sheet_title}' inside Shared Drive...")
-    target_spreadsheet = gc.create(sheet_title, folder_id=SHARED_DRIVE_FOLDER_ID)
-    ws_target = target_spreadsheet.sheet1
-    ws_target.update_title("Form Data")
-    
-    data_to_write = [headers] + (rows if rows else [["No matching submissions found"]])
-    ws_target.update("A1", data_to_write)
-    print(f"✅ Created successfully: https://docs.google.com/spreadsheets/d/{target_spreadsheet.id}")
+        print(f"📌 Found workflow IDs for '{TARGET_FORM}': {target_workflow_ids}")
+
+        # 3. Targeted Query for serviceRequests
+        print(f"🔍 Fetching and filtering 'serviceRequests' for '{TARGET_FORM}'...")
+        raw_docs = []
+        for wf_id in target_workflow_ids:
+            query = db.collection("serviceRequests").where("workflowId", "==", wf_id)
+            for doc in query.stream():
+                d = doc.to_dict()
+                d["__doc_id__"] = doc.id
+                
+                company_val = get_value_from_doc(d, "company", "company")
+                if company_val and str(company_val).strip() == TARGET_COMPANY_ID:
+                    d["__service__"] = workflow_map.get(wf_id, TARGET_FORM)
+                    raw_docs.append(d)
+
+        print(f"🎯 Found {len(raw_docs)} matching service requests.")
+
+        # 4. Targeted Query for tickets
+        ticket_map = {}
+        matching_req_ids = [d["__doc_id__"] for d in raw_docs]
+        if matching_req_ids:
+            print("🎟️ Fetching ticket metadata...")
+            chunk_size = 30
+            for i in range(0, len(matching_req_ids), chunk_size):
+                chunk = matching_req_ids[i:i + chunk_size]
+                for tk in db.collection("tickets").where("requestId", "in", chunk).stream():
+                    t_data = tk.to_dict()
+                    req_id = t_data.get("requestId")
+                    if req_id:
+                        ticket_map[req_id] = {
+                            "ticket_id": t_data.get("id", ""),
+                            "created_at": t_data.get("createdAt", "")
+                        }
+
+        # 5. Extract Data Rows
+        headers = ["Ticket ID", "Ticket Created At", "Service", "Document ID"] + [h for _, _, h in field_definitions]
+        rows = []
+        for doc in raw_docs:
+            tk_info = ticket_map.get(doc["__doc_id__"], {})
+            ticket_id = tk_info.get("ticket_id", "No Ticket ID")
+            created_at = tk_info.get("created_at", "")
+            
+            row = [ticket_id, created_at, doc["__service__"], doc["__doc_id__"]]
+            has_any_value = False
+            for fid, fname, _ in field_definitions:
+                raw_val = get_value_from_doc(doc, fid, fname)
+                formatted_val = format_cell_value(raw_val, subsidiary_map)
+                if formatted_val != "":
+                    has_any_value = True
+                row.append(formatted_val)
+            
+            if has_any_value:
+                rows.append(row)
+
+        # 6. Create Brand New Google Sheet in Shared Drive Folder
+        file_date_str = datetime.now().strftime("%m%d%Y")
+        safe_form_name = TARGET_FORM.replace("/", "-")
+        sheet_title = f"{safe_form_name}_{file_date_str}"
+        
+        print(f"➕ Creating Google Sheet: '{sheet_title}' inside Shared Drive...")
+        target_spreadsheet = gc.create(sheet_title, folder_id=SHARED_DRIVE_FOLDER_ID)
+        ws_target = target_spreadsheet.sheet1
+        ws_target.update_title("Form Data")
+        
+        data_to_write = [headers] + (rows if rows else [["No matching submissions found"]])
+        ws_target.update("A1", data_to_write)
+        
+        file_url = f"https://docs.google.com/spreadsheets/d/{target_spreadsheet.id}"
+        print(f"✅ Created successfully: {file_url}")
+
+        # Send Success Alert
+        success_alert = (
+            f"🟢 *{TARGET_FORM} - Extraction Run Successful*\n"
+            f"• *Execution Date:* {today_str}\n"
+            f"• *Rows Processed & Uploaded:* {len(rows)}\n"
+            f"• *Google Drive Link:* {file_url}"
+        )
+        send_google_chat_notification(success_alert)
+
+    except Exception as e:
+        print(f"❌ Error during execution: {e}")
+        failure_alert = (
+            f"🔴 *{TARGET_FORM} - Extraction CRITICAL FAILURE*\n"
+            f"• *Execution Date:* {today_str}\n"
+            f"• *Error Details:* `{str(e)}`"
+        )
+        send_google_chat_notification(failure_alert)
+        raise e
 
 
 if __name__ == "__main__":
