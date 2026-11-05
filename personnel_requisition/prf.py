@@ -37,7 +37,6 @@ def get_credentials():
     1. Tries Application Default Credentials (ADC) — auto-authenticates natively in Cloud Run.
     2. Falls back to local 'service_account.json' or 'google_creds.json' for local runs.
     """
-    # 1. Cloud Run / GCP Environment (ADC)
     try:
         creds, project = google.auth.default(scopes=SCOPES)
         print("🔒 Authenticated natively via Cloud Run Service Account (ADC)")
@@ -45,7 +44,6 @@ def get_credentials():
     except Exception as e:
         print(f"⚠️ ADC not detected, falling back to local files... ({e})")
 
-    # 2. Local Fallback
     for creds_filename in ["service_account.json", "google_creds.json"]:
         search_paths = [
             creds_filename,
@@ -140,39 +138,61 @@ def main():
     # 2. Fetch Reference Collections
     print("🏢 Fetching reference collections...")
     subsidiary_map = {sub.id: (sub.to_dict().get("name") or sub.to_dict().get("subsidiaryName") or sub.id) for sub in db.collection("subsidiaries").stream()}
-    workflow_map = {wf.id: wf.to_dict().get("service", "") for wf in db.collection("approvalWorkflows").stream()}
-    ticket_map = {}
-    for tk in db.collection("tickets").stream():
-        data = tk.to_dict()
-        req_id = data.get("requestId")
-        if req_id:
-            ticket_map[req_id] = {"ticket_id": data.get("id", ""), "created_at": data.get("createdAt", "")}
+    
+    workflow_map = {}
+    target_workflow_ids = []
+    for wf in db.collection("approvalWorkflows").stream():
+        service_name = wf.to_dict().get("service", "").strip()
+        workflow_map[wf.id] = service_name
+        if service_name.lower() == TARGET_FORM.lower():
+            target_workflow_ids.append(wf.id)
 
-    # 3. Fetch and Filter serviceRequests
+    print(f"📌 Found workflow IDs for '{TARGET_FORM}': {target_workflow_ids}")
+
+    # 3. Targeted Query for serviceRequests
     print(f"🔍 Fetching and filtering 'serviceRequests' for '{TARGET_FORM}'...")
     raw_docs = []
-    for doc in db.collection("serviceRequests").stream():
-        d = doc.to_dict()
-        d["__doc_id__"] = doc.id
-        
-        service_name = workflow_map.get(d.get("workflowId"), "").strip()
-        
-        if service_name.lower() == TARGET_FORM.lower():
+    for wf_id in target_workflow_ids:
+        # Query Firestore specifically for documents matching target workflowId
+        query = db.collection("serviceRequests").where("workflowId", "==", wf_id)
+        for doc in query.stream():
+            d = doc.to_dict()
+            d["__doc_id__"] = doc.id
+            
             company_val = get_value_from_doc(d, "company", "company")
             if company_val and str(company_val).strip() == TARGET_COMPANY_ID:
-                tk_info = ticket_map.get(doc.id, {})
-                d["__ticket_id__"] = tk_info.get("ticket_id", "No Ticket ID")
-                d["__ticket_created_at__"] = tk_info.get("created_at", "")
-                d["__service__"] = service_name
+                d["__service__"] = workflow_map.get(wf_id, TARGET_FORM)
                 raw_docs.append(d)
 
-    print(f"🎯 Found {len(raw_docs)} matching tickets.")
+    print(f"🎯 Found {len(raw_docs)} matching service requests.")
 
-    # 4. Extract Data Rows
+    # 4. Targeted Query for tickets
+    ticket_map = {}
+    matching_req_ids = [d["__doc_id__"] for d in raw_docs]
+    if matching_req_ids:
+        print("🎟️ Fetching ticket metadata...")
+        # Chunk into groups of 30 due to Firestore 'in' query limit
+        chunk_size = 30
+        for i in range(0, len(matching_req_ids), chunk_size):
+            chunk = matching_req_ids[i:i + chunk_size]
+            for tk in db.collection("tickets").where("requestId", "in", chunk).stream():
+                t_data = tk.to_dict()
+                req_id = t_data.get("requestId")
+                if req_id:
+                    ticket_map[req_id] = {
+                        "ticket_id": t_data.get("id", ""),
+                        "created_at": t_data.get("createdAt", "")
+                    }
+
+    # 5. Extract Data Rows
     headers = ["Ticket ID", "Ticket Created At", "Service", "Document ID"] + [h for _, _, h in field_definitions]
     rows = []
     for doc in raw_docs:
-        row = [doc["__ticket_id__"], doc["__ticket_created_at__"], doc["__service__"], doc["__doc_id__"]]
+        tk_info = ticket_map.get(doc["__doc_id__"], {})
+        ticket_id = tk_info.get("ticket_id", "No Ticket ID")
+        created_at = tk_info.get("created_at", "")
+        
+        row = [ticket_id, created_at, doc["__service__"], doc["__doc_id__"]]
         has_any_value = False
         for fid, fname, _ in field_definitions:
             raw_val = get_value_from_doc(doc, fid, fname)
@@ -184,7 +204,7 @@ def main():
         if has_any_value:
             rows.append(row)
 
-    # 5. Create Brand New Google Sheet in Shared Drive Folder
+    # 6. Create Brand New Google Sheet in Shared Drive Folder
     today_str = datetime.now().strftime("%m%d%Y")
     safe_form_name = TARGET_FORM.replace("/", "-")
     sheet_title = f"{safe_form_name}_{today_str}"
