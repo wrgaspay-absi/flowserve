@@ -1,15 +1,17 @@
 """
-Extract form submissions for 'Personnel Requisition Form 2.0', filter by Target Company ID, 
+Extract form submissions for 'Transfer Request Form', filter by Target Company ID, 
 and output to a BRAND NEW Google Sheet inside the Shared Drive folder.
-Naming convention: Personnel Requisition Form 2.0_MMDDYYYY
+Naming convention: Transfer Request Form_MMDDYYYY
 """
 
 import os
 import json
 from datetime import datetime
 import gspread
+import google.auth
 from google.cloud import firestore
 from google.oauth2.service_account import Credentials as SACredentials
+from google.oauth2.credentials import Credentials as UserCredentials
 
 # ==============================================================================
 # ⚙️ CONFIGURATION
@@ -17,7 +19,6 @@ from google.oauth2.service_account import Credentials as SACredentials
 
 TARGET_FORM = "Transfer Request Form"
 FIRESTORE_PROJECT_ID = "ticketingtool-prod"
-CREDS_FILE = "service_account.json"  # Automatically checked in current and parent directory
 TARGET_COMPANY_ID = "1EMo1zoZuqqDNINR678H"
 FIELD_DEF_SHEET_ID = "1xaYPnEbx9s4Ho7uXgNJTiAnhEHA3utF7BDIYJZaCXDg"
 SHARED_DRIVE_FOLDER_ID = "12CHNWIQuqMbIHZrFRI2mYp7fF7eJ2kxH"
@@ -31,24 +32,37 @@ SCOPES = [
 # ==============================================================================
 
 
-def get_service_account_credentials(creds_filename):
-    """Locates and loads the Service Account JSON credentials."""
-    search_paths = [
-        creds_filename,
-        os.path.join("..", creds_filename),
-        os.path.join("C:\\flowserve", creds_filename)
-    ]
-    
-    resolved_path = None
-    for path in search_paths:
-        if os.path.exists(path):
-            resolved_path = path
-            break
-            
-    if not resolved_path:
-        raise FileNotFoundError(f"Could not locate '{creds_filename}' in search paths: {search_paths}")
+def get_credentials():
+    """
+    1. Tries Application Default Credentials (ADC) — auto-authenticates natively in Cloud Run.
+    2. Falls back to local 'service_account.json' or 'google_creds.json' for local runs.
+    """
+    # 1. Cloud Run / GCP Environment (ADC)
+    try:
+        creds, project = google.auth.default(scopes=SCOPES)
+        print("🔒 Authenticated natively via Cloud Run Service Account (ADC)")
+        return creds
+    except Exception as e:
+        print(f"⚠️ ADC not detected, falling back to local files... ({e})")
 
-    return SACredentials.from_service_account_file(resolved_path, scopes=SCOPES)
+    # 2. Local Fallback
+    for creds_filename in ["service_account.json", "google_creds.json"]:
+        search_paths = [
+            creds_filename,
+            os.path.join("..", creds_filename),
+            os.path.join("C:\\flowserve", creds_filename)
+        ]
+        for path in search_paths:
+            if os.path.exists(path):
+                print(f"🔑 Loaded local key file: {path}")
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if data.get("type") == "service_account":
+                    return SACredentials.from_service_account_file(path, scopes=SCOPES)
+                else:
+                    return UserCredentials.from_authorized_user_file(path)
+
+    raise FileNotFoundError("Could not authenticate via ADC or local credential files.")
 
 
 def find_col(header, name):
@@ -89,8 +103,8 @@ def format_cell_value(val, subsidiary_map=None):
 
 def main():
     print(f"🚀 Starting extraction script for: {TARGET_FORM}")
-    print("🔑 Loading Service Account credentials...")
-    creds = get_service_account_credentials(CREDS_FILE)
+    print("🔑 Authenticating...")
+    creds = get_credentials()
     gc = gspread.authorize(creds)
     db = firestore.Client(credentials=creds, project=FIRESTORE_PROJECT_ID)
 
